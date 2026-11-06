@@ -5,6 +5,7 @@ import {
   imageEndpointOf,
   imageModelRow,
   imageReferences,
+  imageString,
   isImageModelId,
   normalizeFormat,
   normalizeModel,
@@ -56,6 +57,15 @@ function imageAnswer(overrides = {}) {
   }
 }
 
+function editForm(extra = {}) {
+  const form = new FormData()
+  form.set("model", "agnes-image-2.5-flash")
+  form.set("prompt", "make it blue")
+  form.set("image", new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" }), "a.png")
+  for (const [key, value] of Object.entries(extra)) form.set(key, value)
+  return form
+}
+
 describe("image helpers", () => {
   test("recognizes the two endpoints and image model ids", () => {
     expect(imageEndpointOf("/v1/images/generations")).toBe("generations")
@@ -101,6 +111,13 @@ describe("image helpers", () => {
         { image: ["data:image/png;base64,aGk="] },
       ),
     ).toEqual(["https://example.com/a.png", "data:image/png;base64,aGk="])
+  })
+
+  test("bounds an image source by the 25 MiB input limit", () => {
+    const cap = Math.ceil((25 * 1024 * 1024 * 4) / 3) + 8
+    const uri = "data:image/png;base64,aGk="
+    expect(imageString(uri)).toBe(uri)
+    expect(imageString(`data:image/png;base64,${"A".repeat(cap)}`)).toBeNull()
   })
 })
 
@@ -191,6 +208,76 @@ describe("generations", () => {
       })
     }
     expect((await response.json()).data).toHaveLength(2)
+  })
+
+  test("serializes a fan-out body once and reuses it", async () => {
+    const { fetchImpl, send } = fetchWith(() => jsonRes(imageAnswer()))
+    await send(`${BASE}/images/generations`, {
+      method: "POST",
+      body: JSON.stringify({ model: "agnes-image-2.5-flash", prompt: "a cat", n: 3 }),
+    })
+
+    expect(fetchImpl.calls).toHaveLength(3)
+    expect(fetchImpl.calls[1].init.body).toBe(fetchImpl.calls[0].init.body)
+    expect(fetchImpl.calls[2].init.body).toBe(fetchImpl.calls[0].init.body)
+  })
+
+  test("retries once after a 429 and reports it", async () => {
+    let requests = 0
+    const { fetchImpl, send } = fetchWith(() => {
+      requests++
+      if (requests === 1) {
+        return jsonRes({ error: { message: "rate limited" } }, 429, { "retry-after": "0" })
+      }
+      return jsonRes(imageAnswer())
+    })
+    const response = await send(`${BASE}/images/generations`, {
+      method: "POST",
+      body: JSON.stringify({ model: "agnes-image-2.5-flash", prompt: "a cat" }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchImpl.calls).toHaveLength(2)
+    expect(fetchImpl.calls[1].init.body).toBe(fetchImpl.calls[0].init.body)
+    expect(response.headers.get("x-agnes-retried")).toBe("true")
+    expect((await response.json()).warnings).toContain("retried once after HTTP 429")
+  })
+
+  test("reports a capped n, an unsupported ratio and dropped fields", async () => {
+    const { fetchImpl, send } = fetchWith(() => jsonRes(imageAnswer()))
+    const response = await send(`${BASE}/images/generations`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "agnes-image-2.5-flash",
+        prompt: "a cat",
+        n: 6,
+        ratio: "7:4",
+        quality: "high",
+        background: "opaque",
+        output_format: "jpeg",
+        user: "someone",
+        stream: false,
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchImpl.calls).toHaveLength(4)
+    for (const call of fetchImpl.calls) {
+      expect(JSON.parse(call.init.body)).toEqual({
+        model: "agnes-image-2.5-flash",
+        prompt: "a cat",
+        size: "2K",
+      })
+    }
+    expect(response.headers.get("x-agnes-n-capped")).toBe("true")
+    expect(response.headers.get("x-agnes-ratio-ignored")).toBe("true")
+    expect(response.headers.get("x-agnes-ignored-fields")).toBe(
+      "quality,background,output_format,user",
+    )
+    const warnings = (await response.json()).warnings
+    expect(warnings).toContain("n was normalized to 4")
+    expect(warnings).toContain("ratio is not supported and was ignored")
+    expect(warnings).toContain("ignored unsupported field(s): quality, background, output_format, user")
   })
 
   test("keeps images already generated when a later fan-out request fails", async () => {
@@ -467,9 +554,12 @@ describe("edits", () => {
     expect(sent.get("quality")).toBeNull()
     expect(sent.get("mask")).toBeNull()
     expect(sent.get("image")).toBeInstanceOf(Blob)
+    const body = await response.json()
     expect(response.headers.get("x-agnes-mask-ignored")).toBe("true")
+    expect(response.headers.get("x-agnes-ignored-fields")).toBe("quality")
     expect(response.headers.get("x-agnes-via")).toBe("edits")
-    expect((await response.json()).warnings).toContain("mask is not supported and was ignored")
+    expect(body.warnings).toContain("mask is not supported and was ignored")
+    expect(body.warnings).toContain("ignored unsupported field(s): quality")
   })
 
   test("falls back to generations when the edits backend is unavailable", async () => {
@@ -492,6 +582,68 @@ describe("edits", () => {
     const sent = JSON.parse(fetchImpl.calls[1].init.body)
     expect(sent.extra_body.image[0]).toStartWith("data:image/png;base64,")
     expect(response.headers.get("x-agnes-via")).toBe("generations-fallback")
+  })
+
+  test("skips native edits for five minutes after the backend fails", async () => {
+    let clock = 1_700_000_000_000
+    const fetchImpl = fakeFetch((call) => {
+      if (call.url.endsWith("/images/edits")) {
+        return jsonRes({ error: { message: "no available server" } }, 503)
+      }
+      return jsonRes(imageAnswer())
+    })
+    const send = createImageFetch({
+      fetchImpl,
+      getAuth,
+      keyOf: (a) => a?.key ?? "",
+      base: BASE,
+      now: () => clock,
+    })
+
+    const first = await send(`${BASE}/images/edits`, { method: "POST", body: editForm() })
+    expect(first.status).toBe(200)
+    expect(fetchImpl.calls.map((call) => call.url)).toEqual([
+      `${BASE}/images/edits`,
+      `${BASE}/images/generations`,
+    ])
+
+    const second = await send(`${BASE}/images/edits`, { method: "POST", body: editForm() })
+    expect(second.status).toBe(200)
+    expect(second.headers.get("x-agnes-edits-cooldown")).toBe("true")
+    expect(second.headers.get("x-agnes-via")).toBe("generations-fallback")
+    expect((await second.json()).warnings).toContain(
+      "native edits backend was recently unavailable; used generations",
+    )
+    expect(fetchImpl.calls.map((call) => call.url)).toEqual([
+      `${BASE}/images/edits`,
+      `${BASE}/images/generations`,
+      `${BASE}/images/generations`,
+    ])
+
+    clock += 5 * 60_000
+    await send(`${BASE}/images/edits`, { method: "POST", body: editForm() })
+    expect(fetchImpl.calls.map((call) => call.url)).toEqual([
+      `${BASE}/images/edits`,
+      `${BASE}/images/generations`,
+      `${BASE}/images/generations`,
+      `${BASE}/images/edits`,
+      `${BASE}/images/generations`,
+    ])
+  })
+
+  test("does not cool down after a request-specific edit error", async () => {
+    const fetchImpl = fakeFetch((call) => {
+      if (call.url.endsWith("/images/edits")) {
+        return jsonRes({ error: { message: "bad image" } }, 422)
+      }
+      return jsonRes(imageAnswer())
+    })
+    const send = createImageFetch({ fetchImpl, getAuth, keyOf: (a) => a?.key ?? "", base: BASE, now })
+
+    await send(`${BASE}/images/edits`, { method: "POST", body: editForm() })
+    await send(`${BASE}/images/edits`, { method: "POST", body: editForm() })
+
+    expect(fetchImpl.calls.filter((call) => call.url.endsWith("/images/edits"))).toHaveLength(2)
   })
 
   test("returns 502 instead of re-generating when the edits backend answers without images", async () => {
@@ -627,6 +779,22 @@ describe("validation and errors", () => {
       expect(response.status).toBe(400)
       expect(fetchImpl.calls).toHaveLength(0)
     }
+  })
+
+  test("rejects a base64 image object with a non-image MIME type", async () => {
+    const { fetchImpl, send } = fetchWith(() => jsonRes(imageAnswer()))
+    const response = await send(`${BASE}/images/generations`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "agnes-image-2.5-flash",
+        prompt: "a cat",
+        image: { b64_json: "aGk=", mime_type: "text/plain" },
+      }),
+    })
+
+    expect(response.status).toBe(400)
+    expect((await response.json()).error.param).toBe("image")
+    expect(fetchImpl.calls).toHaveLength(0)
   })
 
   test("passes an upstream OpenAI error through", async () => {

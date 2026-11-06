@@ -132,12 +132,15 @@ Generations fields:
   `agnes-sakiko/agnes-image-2.5-flash` in magpie).
 - `prompt`.
 - `n`: 1–4. Agnes answers one image per request, so the plugin sends the
-  request `n` times and merges the results; values above 4 are cut to 4. If a
-  later request fails, images already generated are still returned with
+  request `n` times and merges the results; values above 4 are cut to 4. A
+  changed `n` adds a `warnings` entry and `x-agnes-n-capped: true`. If a later
+  request fails, images already generated are still returned with
   `x-agnes-partial: true` and a `warnings` entry.
 - `size`: `1K`, `2K`, `3K`, `4K`, or a legacy `WxH` size; absent or `auto`
   becomes `2K`.
-- `ratio`: `1:1`, `3:4`, `4:3`, `16:9`, `9:16`, `2:3`, `3:2`, `21:9`.
+- `ratio`: `1:1`, `3:4`, `4:3`, `16:9`, `9:16`, `2:3`, `3:2`, `21:9`. Any
+  other value is ignored with a `warnings` entry and
+  `x-agnes-ratio-ignored: true`.
 - `response_format`: `url` or `b64_json` (top-level or
   `extra_body.response_format`; `return_base64` is accepted too).
 - `image` / `images`: a public URL, a `data:image/...;base64,...` URI, or an
@@ -156,25 +159,36 @@ Edits fields: `model`, `prompt`, `n`, `size`, `response_format`, one file in
 `image` or several in `image[]`, and optionally `mask`. The plugin forwards a
 multipart edit to Agnes's native `/v1/images/edits`. When that backend answers
 404, 405, 415, 422 or 5xx (it currently answers 503 `no available server`),
-the plugin retries through generations with `extra_body.image`. A native 200
-without images is returned as a 502 rather than re-running the edit, so one
-request is never billed twice. A JSON edit whose images are URLs or data URIs,
-or which puts them in `extra_body.image`, goes to generations directly.
+the plugin retries through generations with `extra_body.image`. After a 5xx
+the native endpoint is skipped for five minutes, so later edits go straight to
+generations; those responses carry `x-agnes-edits-cooldown: true` and a
+warning, and the native endpoint is tried again after the cooldown. A native
+200 without images is returned as a 502 rather than re-running the edit, so
+one request is never billed twice. A JSON edit whose images are URLs or data
+URIs, or which puts them in `extra_body.image`, goes to generations directly.
 
 Ignored: `mask` (Agnes has no mask input; the response carries
 `x-agnes-mask-ignored: true` and a `warnings` entry), `quality`, `background`,
-`output_format`, `user`, and `stream`. Responses are normalized to
-`{created, data, model}`; `revised_prompt` is filled in when missing, and a
-URL is downloaded and returned as `b64_json` when base64 was asked for. The
-download rejects private hosts, redirects, non-image content and files over
-25 MiB. If every requested base64 image fails to download, the request fails
-with 502; if only some fail, the successful ones are returned with
-`x-agnes-b64-missing` and a warning.
+`output_format`, `user`, `stream`, `style`, `moderation`, and
+`partial_images`. When any of the latter list is set, the response carries
+`x-agnes-ignored-fields` listing them plus a `warnings` entry. A generation
+request that answers HTTP 429 is retried once, honoring `Retry-After` up to
+five seconds; the retry adds `x-agnes-retried: true` and a warning. Responses
+are normalized to `{created, data, model}`; `revised_prompt` is filled in when
+missing, and a URL is downloaded and returned as `b64_json` when base64 was
+asked for. The download rejects private hosts, redirects, non-image content
+and files over 25 MiB. If every requested base64 image fails to download, the
+request fails with 502; if only some fail, the successful ones are returned
+with `x-agnes-b64-missing` and a warning.
 
 Extra response headers: `x-agnes-via` (`generations`, `edits`, or
 `generations-fallback`), `x-agnes-partial` (some of `n` failed),
-`x-agnes-empty-items` (answer entries without a URL or base64 data), and
-`x-agnes-b64-missing` (see above).
+`x-agnes-empty-items` (answer entries without a URL or base64 data),
+`x-agnes-b64-missing` (see above), `x-agnes-n-capped` (the request's `n` was
+changed), `x-agnes-ratio-ignored`, `x-agnes-ignored-fields`,
+`x-agnes-edits-cooldown` (native edits skipped after a 5xx), and
+`x-agnes-retried` (one retry after HTTP 429). Every signal except `x-agnes-via`
+also appears in the JSON `warnings` array.
 
 magpie's **Settings → Models → Image models** may not list
 `agnes-image-2.5-flash`: the host recognizes a fixed set of image model names.
