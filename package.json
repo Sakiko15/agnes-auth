@@ -1,0 +1,37 @@
+{
+  "name": "@sakiko15/agnes-auth",
+  "version": "0.2.0",
+  "description": "Unofficial Sakiko fork of the Agnes AI plugin for OpenCode and magpie: Chrome browser sign-in, live text and image models, OpenAI-compatible chat, image generation at /v1/images/generations and /v1/images/edits, plan usage and USD balance",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": { ".": "./opencode2.mjs" },
+  "files": [
+    "index.mjs",
+    "images.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "agnes",
+    "agnes-ai",
+    "image-generation",
+    "text-to-image"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sakiko15/agnes-auth"
+  },
+  "scripts": {
+    "test": "bun test",
+    "test:images": "node scripts/images-smoke.mjs"
+  },
+  "magpie": {
+    "icon": "https://www.agnes-ai.com/images/biglogo.png"
+  }
+}
