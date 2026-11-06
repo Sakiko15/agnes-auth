@@ -144,6 +144,14 @@ Generations fields:
   array of either, for image-to-image and multi-image composition. The
   plugin sends them as `extra_body.image`.
 
+Output dimensions come from Agnes's fixed native tier/ratio table, not from
+an arbitrary `WxH`. For example, `1K` + `1:1` is `1024x1024`, `1K` + `16:9`
+is `1312x736`, and `2K` + `16:9` is `2624x1472`; an unsupported `1920x1080`
+is normalized to `1312x736`. The plugin forwards `size` and `ratio`
+unchanged and never resizes the image. Request `2K` + `16:9` for a larger
+asset, then crop or resize downstream if an exact display resolution is
+required.
+
 Edits fields: `model`, `prompt`, `n`, `size`, `response_format`, one file in
 `image` or several in `image[]`, and optionally `mask`. The plugin forwards a
 multipart edit to Agnes's native `/v1/images/edits`. When that backend answers
