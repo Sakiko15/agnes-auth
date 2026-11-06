@@ -35,6 +35,26 @@ const IGNORED_FIELDS = [
   "partial_images",
 ]
 
+// A 5xx from the native edits backend disables it across loader rebuilds
+// (opencode2 calls auth.loader again when a token changes); key by origin,
+// not by account.
+const editsCooldowns = new Map()
+
+export function resetImageState() {
+  editsCooldowns.clear()
+}
+
+function editsCoolingDown(origin, at) {
+  const until = editsCooldowns.get(origin) ?? 0
+  if (until > at) return true
+  if (until) editsCooldowns.delete(origin)
+  return false
+}
+
+function armEditsCooldown(origin, at) {
+  editsCooldowns.set(origin, at + EDITS_COOLDOWN_MS)
+}
+
 export function isImageModelId(id) {
   return /^agnes-image-/i.test(String(id ?? ""))
 }
@@ -72,6 +92,20 @@ export function normalizeN(n) {
   return Math.max(1, Math.min(MAX_IMAGES, Math.trunc(value)))
 }
 
+// fieldIsSet ignores defaults a caller may send without asking for a change:
+// false, 0, empty strings, "false", "auto" and "default".
+export function fieldIsSet(value) {
+  if (value == null || value === false) return false
+  if (typeof value === "number") return value !== 0
+  if (typeof value === "string") {
+    const text = value.trim().toLowerCase()
+    if (text === "" || text === "false" || text === "auto" || text === "default") return false
+    if (/^\d+$/.test(text)) return Number(text) !== 0
+    return true
+  }
+  return true
+}
+
 // optionNotes reports values the OpenAI shape accepts but Agnes does not
 // honor, without rejecting the request: capped n, an unknown ratio, and the
 // fields this plugin deliberately drops.
@@ -89,11 +123,7 @@ function optionNotes(source = {}, n = 1, ratio = "") {
     warnings.push("ratio is not supported and was ignored")
     headers["x-agnes-ratio-ignored"] = "true"
   }
-  // false and "" are the defaults a caller may send without asking for
-  // anything; only a real value is worth reporting as dropped.
-  const ignored = IGNORED_FIELDS.filter(
-    (key) => source[key] != null && source[key] !== false && source[key] !== "",
-  )
+  const ignored = IGNORED_FIELDS.filter((key) => fieldIsSet(source[key]))
   if (ignored.length) {
     warnings.push(`ignored unsupported field(s): ${ignored.join(", ")}`)
     headers["x-agnes-ignored-fields"] = ignored.join(",")
@@ -156,7 +186,12 @@ export function imageString(value) {
   const text = value.trim()
   if (!text) return null
   if (/^https?:\/\//i.test(text)) return text
-  if (/^data:image\//i.test(text)) return text.length <= MAX_INPUT_BASE64_CHARS ? text : null
+  if (/^data:image\//i.test(text)) {
+    // Only the payload counts toward the limit; the data: prefix does not.
+    const comma = text.indexOf(",")
+    const payload = comma >= 0 ? text.length - comma - 1 : text.length
+    return payload <= MAX_INPUT_BASE64_CHARS ? text : null
+  }
   // A bare base64 image is only accepted when it really decodes to an image;
   // otherwise ordinary prose is mistaken for one. Sniff only the header bytes
   // instead of decoding a potentially large payload in full.
@@ -174,6 +209,19 @@ export function imageString(value) {
   return null
 }
 
+// base64Mime trusts an explicit image/* type; for an absent or generic
+// octet-stream type it sniffs the payload header, matching the Blob path.
+function base64Mime(type, payload) {
+  const mime = String(type ?? "").trim()
+  if (/^image\//i.test(mime)) return mime
+  if (mime && !/^application\/octet-stream$/i.test(mime)) return ""
+  try {
+    return detectImageMime(base64Bytes(String(payload).slice(0, 64))) || "image/png"
+  } catch {
+    return "image/png"
+  }
+}
+
 function imageStrings(value, out, invalid) {
   if (Array.isArray(value)) {
     for (const item of value) imageStrings(item, out, invalid)
@@ -188,8 +236,8 @@ function imageStrings(value, out, invalid) {
       return out
     }
     if (typeof value.b64_json === "string" && value.b64_json) {
-      const mime = typeof value.mime_type === "string" && value.mime_type ? value.mime_type : "image/png"
-      if (!/^image\//i.test(mime) || value.b64_json.length > MAX_INPUT_BASE64_CHARS) {
+      const mime = base64Mime(value.mime_type, value.b64_json)
+      if (!mime || value.b64_json.length > MAX_INPUT_BASE64_CHARS) {
         invalid?.push(value)
         return out
       }
@@ -197,8 +245,8 @@ function imageStrings(value, out, invalid) {
       return out
     }
     if (typeof value.base64 === "string" && value.base64) {
-      const mime = typeof value.mime_type === "string" && value.mime_type ? value.mime_type : "image/png"
-      if (!/^image\//i.test(mime) || value.base64.length > MAX_INPUT_BASE64_CHARS) {
+      const mime = base64Mime(value.mime_type, value.base64)
+      if (!mime || value.base64.length > MAX_INPUT_BASE64_CHARS) {
         invalid?.push(value)
         return out
       }
@@ -220,8 +268,12 @@ function imageStrings(value, out, invalid) {
 export function imageReferencesDetailed(body, extra = {}) {
   const refs = []
   const invalid = []
-  for (const key of ["image", "images"]) imageStrings(body?.[key], refs, invalid)
-  for (const key of ["image", "images"]) imageStrings(extra?.[key], refs, invalid)
+  for (const key of ["image", "images", "image[]", "images[]"]) {
+    imageStrings(body?.[key], refs, invalid)
+  }
+  for (const key of ["image", "images", "image[]", "images[]"]) {
+    imageStrings(extra?.[key], refs, invalid)
+  }
   return { refs: [...new Set(refs)], invalid }
 }
 
@@ -247,7 +299,6 @@ export function createImageFetch({
 } = {}) {
   if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl is not a function")
   const baseOrigin = new URL(base).origin
-  const state = { editsUnavailableUntil: 0 }
   return async function imageFetch(input, init) {
     const requestInit = init ?? {}
     const url = urlOf(input)
@@ -283,7 +334,7 @@ export function createImageFetch({
       if (endpoint === "generations") {
         return await handleGenerations({ body, fetchImpl, base, headers, signal, now })
       }
-      return await handleEdits({ body, contentType, fetchImpl, base, headers, signal, now, state })
+      return await handleEdits({ body, contentType, fetchImpl, base, headers, signal, now, origin: baseOrigin })
     } catch (error) {
       if (abortLike(error) || signal?.aborted) throw error
       return errorResponse(502, error?.message ?? String(error), "upstream_error")
@@ -313,11 +364,13 @@ async function handleGenerations({ body, fetchImpl, base, headers, signal, now }
   const n = normalizeN(input.n ?? extraIn.n)
   const size = normalizeSize(input.size ?? extraIn.size, "2K")
   const ratio = normalizeRatio(input.ratio ?? extraIn.ratio)
-  const notes = optionNotes(
-    { ...input, n: input.n ?? extraIn.n, ratio: input.ratio ?? extraIn.ratio },
-    n,
-    ratio,
-  )
+  // Known-ignored fields are dropped from extra_body too, but an
+  // extra_body value still counts when the top-level one is a default.
+  const noteSource = { n: input.n ?? extraIn.n, ratio: input.ratio ?? extraIn.ratio }
+  for (const key of IGNORED_FIELDS) {
+    noteSource[key] = fieldIsSet(input[key]) ? input[key] : extraIn[key]
+  }
+  const notes = optionNotes(noteSource, n, ratio)
   const requested = {
     endpoint: "generations",
     originalModel: String(input.model),
@@ -328,7 +381,7 @@ async function handleGenerations({ body, fetchImpl, base, headers, signal, now }
     ratio,
     responseFormat: format,
     images,
-    maskIgnored: input.mask != null,
+    maskIgnored: input.mask != null || extraIn.mask != null,
     warnings: notes.warnings,
     headers: notes.headers,
     via: "generations",
@@ -336,7 +389,7 @@ async function handleGenerations({ body, fetchImpl, base, headers, signal, now }
   return await runGenerations({ requested, fetchImpl, base, headers, signal, now, extraIn })
 }
 
-async function handleEdits({ body, contentType, fetchImpl, base, headers, signal, now, state }) {
+async function handleEdits({ body, contentType, fetchImpl, base, headers, signal, now, origin }) {
   let form = null
   let json = null
   if (body instanceof FormData) {
@@ -378,8 +431,8 @@ async function handleEdits({ body, contentType, fetchImpl, base, headers, signal
     fields.response_format = json.response_format ?? extra.response_format
     fields.return_base64 = json.return_base64 ?? extra.return_base64
     for (const key of IGNORED_FIELDS) {
-      if (json[key] != null) fields[key] = json[key]
-      else if (extra[key] != null) fields[key] = extra[key]
+      if (fieldIsSet(json[key])) fields[key] = json[key]
+      else if (fieldIsSet(extra[key])) fields[key] = extra[key]
     }
     for (const key of ["image", "images", "image[]", "images[]"]) {
       imageStrings(json[key], images, invalid)
@@ -396,6 +449,9 @@ async function handleEdits({ body, contentType, fetchImpl, base, headers, signal
   if (!model) return badRequest("model is required", "model")
   if (!prompt) return badRequest("prompt is required", "prompt")
   if (!images.length) return badRequest("an edit needs the image to edit", "image")
+  if (images.some((value) => value instanceof Blob && value.size > MAX_IMAGE_BYTES)) {
+    return badRequest("an image is larger than 25 MiB", "image")
+  }
 
   const n = normalizeN(fields.n)
   const size = normalizeSize(fields.size, "1024x1024")
@@ -422,8 +478,10 @@ async function handleEdits({ body, contentType, fetchImpl, base, headers, signal
   }
 
   const allFiles = images.every((value) => value instanceof Blob)
-  if (allFiles && n === 1) {
-    if (now() < state.editsUnavailableUntil) {
+  // The native endpoint has no ratio input; a ratio request goes through
+  // generations so the aspect ratio is actually honored.
+  if (allFiles && n === 1 && !ratio) {
+    if (editsCoolingDown(origin, now())) {
       requested.nativeSkipped = true
     } else {
       const native = await runNativeEdits({
@@ -434,7 +492,7 @@ async function handleEdits({ body, contentType, fetchImpl, base, headers, signal
         headers,
         signal,
         now,
-        state,
+        origin,
       })
       if (native.response) return native.response
       if (!native.fallback) return native.error
@@ -447,11 +505,11 @@ async function handleEdits({ body, contentType, fetchImpl, base, headers, signal
     return badRequest("an image is not a URL, data URI, or file", "image")
   }
   requested.images = references
-  requested.via = allFiles ? "generations-fallback" : "generations"
+  requested.via = allFiles && !ratio ? "generations-fallback" : "generations"
   return await runGenerations({ requested, fetchImpl, base, headers, signal, now })
 }
 
-async function runNativeEdits({ requested, images, fetchImpl, base, headers, signal, now, state }) {
+async function runNativeEdits({ requested, images, fetchImpl, base, headers, signal, now, origin }) {
   const form = new FormData()
   form.set("model", requested.model)
   form.set("prompt", requested.prompt)
@@ -481,25 +539,44 @@ async function runNativeEdits({ requested, images, fetchImpl, base, headers, sig
     } catch {}
   } catch (error) {
     if (abortLike(error) || signal?.aborted) throw error
-    return { error: errorResponse(502, error?.message ?? String(error), "upstream_error") }
+    return {
+      error: await decorateFailure(
+        errorResponse(502, error?.message ?? String(error), "upstream_error"),
+        requested,
+      ),
+    }
   }
   if (res.ok) {
     if (json && Array.isArray(json.data) && json.data.length) {
       return { response: await finishImages({ requested, responses: [json], fetchImpl, signal, now }) }
     }
     const message = json?.error?.message || "Agnes returned no images"
-    return { error: errorResponse(502, message, "upstream_error") }
+    return {
+      error: await decorateFailure(errorResponse(502, message, "upstream_error"), requested),
+    }
   }
   if (FALLBACK_EDIT_STATUSES.has(res.status) || res.status >= 500) {
-    if (res.status >= 500) state.editsUnavailableUntil = now() + EDITS_COOLDOWN_MS
+    if (res.status >= 500) armEditsCooldown(origin, now())
     return { fallback: true }
   }
-  return { error: await upstreamError(res, text) }
+  return { error: await decorateFailure(await upstreamError(res, text), requested) }
 }
 
 async function runGenerations({ requested, fetchImpl, base, headers, signal, now, extraIn = {} }) {
   const extra = { ...extraIn }
-  for (const key of ["image", "images", "images[]", "image[]", "ratio", "response_format", "return_base64", "n", "size"]) {
+  for (const key of [
+    "image",
+    "images",
+    "images[]",
+    "image[]",
+    "mask",
+    "ratio",
+    "response_format",
+    "return_base64",
+    "n",
+    "size",
+    ...IGNORED_FIELDS,
+  ]) {
     delete extra[key]
   }
   if (requested.images.length) extra.image = requested.images
@@ -532,7 +609,10 @@ async function runGenerations({ requested, fetchImpl, base, headers, signal, now
     }
     responses.push(result.json)
   }
-  if (!responses.length) return failure ?? errorResponse(502, "Agnes returned no images", "upstream_error")
+  if (!responses.length) {
+    const response = failure ?? errorResponse(502, "Agnes returned no images", "upstream_error")
+    return await decorateFailure(response, requested)
+  }
   // Images already generated and billed are returned even when a later one
   // fails; warnings and x-agnes-partial make the shortfall visible.
   requested.partial = responses.length < requested.n
@@ -545,7 +625,7 @@ async function postJson(fetchImpl, url, bodyText, headers, signal) {
   outgoing.set("content-type", "application/json")
   outgoing.set("accept", "application/json")
   let retried = false
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     try {
       const res = await fetchImpl(url, {
         method: "POST",
@@ -560,39 +640,54 @@ async function postJson(fetchImpl, url, bodyText, headers, signal) {
       } catch {}
       if (res.status === 429 && attempt < MAX_RETRIES) {
         retried = true
-        if (signal?.aborted) {
-          if (typeof signal.throwIfAborted === "function") signal.throwIfAborted()
-          throw new DOMException("Aborted", "AbortError")
-        }
-        await sleep(retryDelayMs(res))
+        await sleep(retryDelayMs(res), signal)
         continue
       }
       return { res, text, json, retried }
     } catch (error) {
       if (abortLike(error) || signal?.aborted) throw error
-      return { error: errorResponse(502, error?.message ?? String(error), "upstream_error") }
+      return { error: errorResponse(502, error?.message ?? String(error), "upstream_error"), retried }
     }
   }
-  return { error: errorResponse(502, "retry loop ended without a response", "upstream_error") }
 }
 
-function retryDelayMs(res) {
-  const value = Number(res.headers.get("retry-after"))
-  if (Number.isFinite(value) && value >= 0) return Math.min(value * 1000, RETRY_MAX_MS)
-  return 500
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-async function finishImages({ requested, responses, fetchImpl, signal, now }) {
-  const first = responses[0]
-  const merged = {
-    ...first,
-    data: responses.flatMap((response) => (Array.isArray(response.data) ? response.data : [])),
+// retryDelayMs reads Retry-After as seconds or an HTTP date; a missing or
+// unreadable header gets a short fixed backoff.
+export function retryDelayMs(res, at = Date.now()) {
+  const raw = String(res?.headers?.get?.("retry-after") ?? "").trim()
+  if (!raw) return 500
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds)) {
+    return seconds >= 0 ? Math.min(seconds * 1000, RETRY_MAX_MS) : 500
   }
-  const headers = { ...(requested.headers ?? {}), "x-agnes-via": requested.via }
+  const date = Date.parse(raw)
+  if (!Number.isFinite(date)) return 500
+  return Math.min(Math.max(0, date - at), RETRY_MAX_MS)
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"))
+      return
+    }
+    let timer
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException("Aborted", "AbortError"))
+    }
+    timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener?.("abort", onAbort, { once: true })
+  })
+}
+
+// imageNotices is the x-agnes-* header/warning set for a request, shared by
+// successful answers and decorated failures.
+function imageNotices(requested) {
+  const headers = { ...(requested.headers ?? {}) }
   const warnings = [...(requested.warnings ?? [])]
   if (requested.nativeSkipped) {
     headers["x-agnes-edits-cooldown"] = "true"
@@ -610,6 +705,18 @@ async function finishImages({ requested, responses, fetchImpl, signal, now }) {
     headers["x-agnes-partial"] = "true"
     warnings.push("Agnes returned fewer images than requested")
   }
+  return { headers, warnings }
+}
+
+async function finishImages({ requested, responses, fetchImpl, signal, now }) {
+  const first = responses[0]
+  const merged = {
+    ...first,
+    data: responses.flatMap((response) => (Array.isArray(response.data) ? response.data : [])),
+  }
+  const notices = imageNotices(requested)
+  const headers = { ...notices.headers, "x-agnes-via": requested.via }
+  const warnings = notices.warnings
 
   let dropped = 0
   let data = []
@@ -626,16 +733,20 @@ async function finishImages({ requested, responses, fetchImpl, signal, now }) {
     headers["x-agnes-empty-items"] = String(dropped)
     warnings.push("Agnes returned images without a url or b64_json")
   }
-  if (!data.length) return errorResponse(502, "Agnes returned no images", "upstream_error")
+  if (!data.length) {
+    return errorWithNotices(502, "Agnes returned no images", "upstream_error", headers, warnings)
+  }
 
   if (requested.responseFormat === "b64_json") {
     const missing = data.filter((entry) => !entry.b64_json)
     if (missing.length) {
       if (missing.length === data.length) {
-        return errorResponse(
+        return errorWithNotices(
           502,
           "Agnes generated an image but it could not be downloaded for b64_json",
           "inline_failed",
+          headers,
+          warnings,
         )
       }
       data = data.filter((entry) => entry.b64_json)
@@ -643,7 +754,9 @@ async function finishImages({ requested, responses, fetchImpl, signal, now }) {
       warnings.push("some images could not be downloaded for b64_json")
     }
   }
-  if (!data.length) return errorResponse(502, "Agnes returned no images", "upstream_error")
+  if (!data.length) {
+    return errorWithNotices(502, "Agnes returned no images", "upstream_error", headers, warnings)
+  }
 
   const created = Number(merged.created)
   const stamp = Number.isFinite(created) && created > 0 ? created : Math.floor(now() / 1000)
@@ -800,6 +913,52 @@ function errorResponse(status, message, code = "", param = "", type = status >= 
     { error: { message: String(message), type, param, code: String(code || status) } },
     status,
   )
+}
+
+// errorWithNotices is errorResponse plus the request's warnings and headers.
+function errorWithNotices(status, message, code, headers, warnings) {
+  return jsonResponse(
+    {
+      error: {
+        message: String(message),
+        type: status >= 500 ? "upstream_error" : "invalid_request_error",
+        param: "",
+        code: String(code || status),
+      },
+      ...(warnings?.length ? { warnings: [...warnings] } : {}),
+    },
+    status,
+    headers,
+  )
+}
+
+// decorateFailure preserves an upstream status and body while adding the
+// x-agnes-* headers and warnings computed for the request.
+async function decorateFailure(response, requested) {
+  const { headers, warnings } = imageNotices(requested)
+  headers["x-agnes-via"] = requested.via
+  const outgoing = new Headers(response.headers)
+  for (const [key, value] of Object.entries(headers)) outgoing.set(key, value)
+  outgoing.delete("content-length")
+  const text = await response.text()
+  let body
+  try {
+    body = JSON.parse(text)
+  } catch {}
+  if (warnings.length && body && typeof body === "object" && !Array.isArray(body)) {
+    const existing = Array.isArray(body.warnings) ? body.warnings : []
+    body.warnings = [...existing, ...warnings]
+    return new Response(JSON.stringify(body), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: outgoing,
+    })
+  }
+  return new Response(text, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: outgoing,
+  })
 }
 
 function jsonResponse(body, status = 200, headers = {}) {
